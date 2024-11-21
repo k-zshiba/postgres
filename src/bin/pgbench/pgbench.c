@@ -5148,13 +5148,13 @@ initPopulateTablePartially(void *arg)
 	nstate = thread->nstate;
 	chars = 1;
 	log_interval = 1;
+	partition = 0;
 	table = "pgbench_accounts";
 	/* Stay on the same line if reporting to a terminal */
 	eol = isatty(fileno(stderr)) ? '\r' : '\n';
 	
 	if ((con = doConnect()) == NULL)
 		pg_fatal("could not create connection for initialization");
-	fprintf(stderr, "%d\n", thread->partition);
 	for(int p = 0; p < thread->partition; p++)
 	{
 		initPQExpBuffer(&sql);
@@ -5172,7 +5172,6 @@ initPopulateTablePartially(void *arg)
 			pg_fatal("invalid format string");
 
 		res = PQexec(con, copy_statement);
-
 		if (PQresultStatus(res) != PGRES_COPY_IN)
 			pg_fatal("unexpected copy in result: %s", PQerrorMessage(con));
 		PQclear(res);
@@ -5187,8 +5186,8 @@ initPopulateTablePartially(void *arg)
 		part_size = (total + partitions - 1)/ partitions;
 		if (partitions > 0)
 		{
-			first = (partition) * part_size + 1;
-			last = partition * part_size;
+			first = (partition - 1) * part_size;
+			last = partition * part_size - 1;
 		}else
 		{
 			first = total/nthreads * thread->tid;
@@ -5237,7 +5236,6 @@ initPopulateTablePartially(void *arg)
 					}
 				}
 		}
-
 		if (chars != 0 && eol != '\n')
 			fprintf(stderr, "%*c\r", chars - 1, ' ');	/* Clear the current line */
 
