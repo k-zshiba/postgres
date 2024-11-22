@@ -5070,7 +5070,7 @@ parallelInitPopulateTable(PGconn *con, const char *table, int64 base,
 		thread->nstate =
 			(nclients - nclients_dealt + nthreads - i - 1) / (nthreads - i);
 		thread->partition = 
-			(partitions - partitions_dealt + nthreads - i - 1) / (nthreads - i);
+			(partitions == 0) ? 1 : (partitions - partitions_dealt + nthreads - i - 1) / (nthreads - i);
 		// initRandomState(&thread->ts_choose_rs);
 		// initRandomState(&thread->ts_throttle_rs);
 		// initRandomState(&thread->ts_sample_rs);
@@ -5139,7 +5139,7 @@ initPopulateTablePartially(void *arg)
 	int chars, log_interval;
 	pg_time_usec_t start;
 	int64		thread_start;
-	const char *copy_statement_fmt = "copy %s%s%d from stdin";
+	const char *copy_statement_fmt = (partitions == 0) ? "copy %s from stdin" : "copy %s%s%d from stdin";
 	int64		total = naccounts * (int64) scale;
 
 	TState	   *thread = (TState *) arg;
@@ -5164,7 +5164,7 @@ initPopulateTablePartially(void *arg)
 			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table, "_", partition);
 		}else
 		{
-			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table, "", NULL);
+			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table);
 		}
 		if (n >= sizeof(copy_statement))
 			pg_fatal("invalid buffer size: must be at least %d characters long", n);
@@ -5183,7 +5183,7 @@ initPopulateTablePartially(void *arg)
 		THREAD_BARRIER_WAIT(&barrier);
 		thread_start = pg_time_now();
 		thread->started_time = thread_start;
-		part_size = (total + partitions - 1)/ partitions;
+		part_size = (partition == 0) ? total : (total + partitions - 1)/ partitions;
 		if (partitions > 0)
 		{
 			first = (partition - 1) * part_size;
@@ -7313,7 +7313,7 @@ main(int argc, char **argv)
 	if (!is_init_mode && nthreads > nclients)
 		nthreads = nclients;
 
-	if (is_init_mode && nthreads > partitions)
+	if (is_init_mode && partitions != 0 && nthreads > partitions)
 	{
 		nclients = nthreads;
 		nthreads = partitions;
