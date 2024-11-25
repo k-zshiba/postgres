@@ -16,6 +16,7 @@ sub check_data_state
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 	my $node = shift;
 	my $type = shift;
+	my $scale = shift;
 
 	my $sql_result = $node->safe_psql('postgres',
 		'SELECT count(*) AS null_count FROM pgbench_accounts WHERE filler IS NULL LIMIT 10;'
@@ -25,12 +26,12 @@ sub check_data_state
 	$sql_result = $node->safe_psql('postgres',
 		'SELECT count(*) AS null_count FROM pgbench_branches WHERE filler IS NULL;'
 	);
-	is($sql_result, '1',
+	is($sql_result, 1 * $scale,
 		"$type: filler column of pgbench_branches has only NULL data");
 	$sql_result = $node->safe_psql('postgres',
 		'SELECT count(*) AS null_count FROM pgbench_tellers WHERE filler IS NULL;'
 	);
-	is($sql_result, '10',
+	is($sql_result, 10 * $scale,
 		"$type: filler column of pgbench_tellers has only NULL data");
 	$sql_result = $node->safe_psql('postgres',
 		'SELECT count(*) AS data_count FROM pgbench_history;');
@@ -46,10 +47,10 @@ $node->start;
 
 # check if threads are supported while initialization
 my $naccounts = 100000;
-my $scale = 100;
+my $scale = 10;
 # no partition
 $node->pgbench(
-    '-q -j 2 -i -s 100',
+    '-q -j 2 -i -s 10',
 	0,
 	[qr{^$}],
 	[
@@ -61,27 +62,27 @@ $node->pgbench(
 	],
 	'pgbench parallel initialization without partitions');
 # Check data state, after client-side data generation.
-check_data_state($node, 'client-side');
-is($node-safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [no partition]');
+check_data_state($node, 'client-side', $scale);
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [no partition]');
 
 # parallel copy into partition table
 $node->pgbench(
-    '-1 -j 2 -i -s 100 --partitions=4',
+    '-q -j 2 -i -s 10 --partitions=4',
 	0,
 	[qr{^$}],
 	[
 		qr{dropping old tables},
 		qr{creating tables},
 		qr{creating 4 partitions},
-		qr{generating data (client-side) by multiple worker threads},
+		qr{generating data \(client-side\) by multiple worker threads},
         qr{vacuuming},
 		qr{creating primary keys},
 		qr{done in \d+\.\d\d s }
 	],
 	'pgbench parallel initialization with partitions');
 # Check data state, after client-side data generation.
-check_data_state($node, 'client-side');
-is($node-safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [partition]');
+check_data_state($node, 'client-side', $scale);
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [partition]');
 
 $node->stop;
 done_testing();
