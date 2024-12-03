@@ -67,6 +67,25 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $nacc
 
 # parallel copy into partition table
 $node->pgbench(
+    '-q -j 3 -i -s 10 --partitions=3',
+	0,
+	[qr{^$}],
+	[
+		qr{dropping old tables},
+		qr{creating tables},
+		qr{creating 3 partitions},
+		qr{generating data \(client-side\) by multiple worker threads},
+        qr{vacuuming},
+		qr{creating primary keys},
+		qr{done in \d+\.\d\d s }
+	],
+	'pgbench parallel initialization with partitions');
+# Check data state, after client-side data generation.
+check_data_state($node, 'client-side', $scale);
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [odd partitions]');
+
+# parallel copy into partition table
+$node->pgbench(
     '-q -j 2 -i -s 10 --partitions=4',
 	0,
 	[qr{^$}],
@@ -82,7 +101,6 @@ $node->pgbench(
 	'pgbench parallel initialization with partitions');
 # Check data state, after client-side data generation.
 check_data_state($node, 'client-side', $scale);
-is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [partition]');
-
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts;'), $naccounts * $scale, 'parallel copy [even partitions]');
 $node->stop;
 done_testing();

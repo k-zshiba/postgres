@@ -5071,9 +5071,6 @@ parallelInitPopulateTable(PGconn *con, const char *table, int64 base,
 			(nclients - nclients_dealt + nthreads - i - 1) / (nthreads - i);
 		thread->partition = 
 			(partitions == 0) ? 1 : (partitions - partitions_dealt + nthreads - i - 1) / (nthreads - i);
-		// initRandomState(&thread->ts_choose_rs);
-		// initRandomState(&thread->ts_throttle_rs);
-		// initRandomState(&thread->ts_sample_rs);
 		thread->logfile = NULL; /* filled in later */
 		thread->latency_late = 0;
 		initStats(&thread->stats, 0);
@@ -5155,17 +5152,23 @@ initPopulateTablePartially(void *arg)
 	
 	if ((con = doConnect()) == NULL)
 		pg_fatal("could not create connection for initialization");
-	for(int p = 0; p < thread->partition; p++)
+	for(int p = 1; p <= thread->partition; p++)
 	{
 		initPQExpBuffer(&sql);
+		part_size = (partitions == 0) ? total : (total + partitions - 1)/ partitions;
 		if(partitions > 0)
 		{
-			partition = thread->tid + nthreads * p + 1;
+			partition = thread->tid + nthreads * (p - 1) + 1; /* target partition (from 1 to the number set by the --partitions option)*/
+			first = (partition - 1) * part_size;
+			last = (partition == partitions) ? total - 1 : partition * part_size - 1;
 			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table, "_", partition);
 		}else
 		{
+			first = total/nthreads * thread->tid;
+			last = first + total/nthreads - 1;
 			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table);
 		}
+
 		if (n >= sizeof(copy_statement))
 			pg_fatal("invalid buffer size: must be at least %d characters long", n);
 		else if (n == -1)
@@ -5174,7 +5177,8 @@ initPopulateTablePartially(void *arg)
 		res = PQexec(con, copy_statement);
 		if (PQresultStatus(res) != PGRES_COPY_IN)
 			pg_fatal("unexpected copy in result: %s", PQerrorMessage(con));
-		PQclear(res);
+		
+                PQclear(res);
 	
 		for (int i = 0; i < nstate; i++)
 			state[i].state = CSTATE_CHOOSE_SCRIPT;
@@ -5183,17 +5187,8 @@ initPopulateTablePartially(void *arg)
 		THREAD_BARRIER_WAIT(&barrier);
 		thread_start = pg_time_now();
 		thread->started_time = thread_start;
-		part_size = (partition == 0) ? total : (total + partitions - 1)/ partitions;
-		if (partitions > 0)
-		{
-			first = (partition - 1) * part_size;
-			last = partition * part_size - 1;
-		}else
-		{
-			first = total/nthreads * thread->tid;
-			last = first + total/nthreads - 1;
-		}
-		for (k = first; k <= last; k++)
+		
+                for (k = first; k <= last; k++)
 		{
 			int64		j = k + 1;
 			initAccount(&sql, k);
@@ -5203,38 +5198,38 @@ initPopulateTablePartially(void *arg)
 			if (CancelRequested)
 				break;
 
-		    /*
-		     * If we want to stick with the original logging, print a message each
-		     * 100k inserted rows.
-		     */
+                       /*
+		        * If we want to stick with the original logging, print a message each
+		        * 100k inserted rows.
+		        */
 		        if ((!use_quiet) && (j % 100000 == 0))
 		        {
 		        	double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
-					double		remaining_sec = ((double) total - j) * elapsed_sec / j;
+				double		remaining_sec = ((double) total - j) * elapsed_sec / j;
 
 		        	chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
 		        					j, total,
 		        					(int) ((j * 100) / total),
 		        					table, elapsed_sec, remaining_sec, eol);
-				}
-				/* let's not call the timing for each row, but only each 100 rows */
-				else if (use_quiet && (j % 100 == 0))
-				{
-						double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
-						double		remaining_sec = ((double) total - j) * elapsed_sec / j;
+                        }
+                        /* let's not call the timing for each row, but only each 100 rows */
+                        else if (use_quiet && (j % 100 == 0))
+                        {
+                                double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
+                                double		remaining_sec = ((double) total - j) * elapsed_sec / j;
 
-		        	/* have we reached the next interval (or end)? */
-		        	if ((j == total) || (elapsed_sec >= log_interval * LOG_STEP_SECONDS))
-		        	{
-		        		chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
-		        						j, total,
-		        						(int) ((j * 100) / total),
-		        						table, elapsed_sec, remaining_sec, eol);
+                                /* have we reached the next interval (or end)? */
+                                if ((j == total) || (elapsed_sec >= log_interval * LOG_STEP_SECONDS))
+                                {
+                                        chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
+                                                                        j, total,
+                                                                        (int) ((j * 100) / total),
+                                                                        table, elapsed_sec, remaining_sec, eol);
 
-				    /* skip to the next interval */
-				    log_interval = (int) ceil(elapsed_sec / LOG_STEP_SECONDS);
-					}
-				}
+                                    /* skip to the next interval */
+                                    log_interval = (int) ceil(elapsed_sec / LOG_STEP_SECONDS);
+                                }
+                        }
 		}
 		if (chars != 0 && eol != '\n')
 			fprintf(stderr, "%*c\r", chars - 1, ' ');	/* Clear the current line */
