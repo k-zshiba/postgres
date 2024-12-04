@@ -372,6 +372,12 @@ CREATE INDEX hash_tuplesort_idx ON tenk1 USING hash (stringu1 name_ops) WITH (fi
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM tenk1 WHERE stringu1 = 'TVAAAA';
 SELECT count(*) FROM tenk1 WHERE stringu1 = 'TVAAAA';
+-- OR-clauses shouldn't be transformed into SAOP because hash indexes don't
+-- support SAOP scans.
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) FROM tenk1 WHERE stringu1 = 'TVAAAA' OR  stringu1 = 'TVAAAB';
+RESET enable_seqscan;
 DROP INDEX hash_tuplesort_idx;
 RESET maintenance_work_mem;
 
@@ -728,9 +734,9 @@ DROP TABLE onek_with_null;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM tenk1
-  WHERE thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42);
+  WHERE thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42 OR tenthous = 0);
 SELECT * FROM tenk1
-  WHERE thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42);
+  WHERE thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42 OR tenthous = 0);
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM tenk1

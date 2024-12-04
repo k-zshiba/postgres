@@ -1354,8 +1354,11 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 		{
 			IndexOptInfo *index = (IndexOptInfo *) lfirst(lc2);
 
-			/* Ignore index if it doesn't support bitmap scans */
-			if (!index->amhasgetbitmap)
+			/*
+			 * Ignore index if it doesn't support bitmap scans or SAOP
+			 * clauses.
+			 */
+			if (!index->amhasgetbitmap || !index->amsearcharray)
 				continue;
 
 			for (colnum = 0; colnum < index->nkeycolumns; colnum++)
@@ -2463,7 +2466,7 @@ match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
 		clauses = generate_implied_equalities_for_column(root,
 														 index->rel,
 														 ec_member_matches_indexcol,
-														 (void *) &arg,
+														 &arg,
 														 index->rel->lateral_referencers);
 
 		/*
@@ -3248,6 +3251,10 @@ match_orclause_to_indexcol(PlannerInfo *root,
 	Assert(IsA(orclause, BoolExpr));
 	Assert(orclause->boolop == OR_EXPR);
 
+	/* Ignore index if it doesn't support SAOP clauses */
+	if (!index->amsearcharray)
+		return NULL;
+
 	/*
 	 * Try to convert a list of OR-clauses to a single SAOP expression. Each
 	 * OR entry must be in the form: (indexkey operator constant) or (constant
@@ -3430,7 +3437,7 @@ match_orclause_to_indexcol(PlannerInfo *root,
 		elems = (Datum *) palloc(sizeof(Datum) * list_length(consts));
 		foreach_node(Const, value, consts)
 		{
-			Assert(!value->constisnull && value->constvalue);
+			Assert(!value->constisnull);
 
 			elems[i++] = value->constvalue;
 		}
