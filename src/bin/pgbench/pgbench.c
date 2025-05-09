@@ -650,7 +650,7 @@ typedef struct
 	THREAD_T	thread;			/* thread handle */
 	CState	   *state;			/* array of CState */
 	int			nstate;			/* length of state[] */
-
+	int         partition;      /* target partition */
 	/*
 	 * Separate randomness for each thread. Each thread option uses its own
 	 * random state to make all of them independent of each other and
@@ -831,6 +831,7 @@ static void doLog(TState *thread, CState *st,
 static void processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 							 bool skipped, StatsData *agg);
 static void addScript(const ParsedScript *script);
+static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC  initPopulateTablePartially(void *arg);
 static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC threadRun(void *arg);
 static void finishCon(CState *st);
 static void setalarm(int seconds);
@@ -5079,16 +5080,220 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 	termPQExpBuffer(&sql);
 }
 
-/*
- * Fill the standard tables with some data generated and sent from the client.
- *
- * The filler column is NULL in pgbench_branches and pgbench_tellers, and is
- * a blank-padded string in pgbench_accounts.
- */
 static void
-initGenerateDataClientSide(PGconn *con)
+parallelInitPopulateTable(PGconn *con, const char *table, int64 base,
+				  initRowMethod init_row)
 {
-	fprintf(stderr, "generating data (client-side)...\n");
+	CState    *state;
+	TState    *threads;
+	int exit_code;
+	int nclients_dealt, partitions_dealt;
+	state = (CState *) pg_malloc0(sizeof(CState));
+	if (nclients > 1)
+	{
+		state = (CState *) pg_realloc(state, sizeof(CState) * nclients);
+		memset(state + 1, 0, sizeof(CState) * (nclients - 1));
+	}
+
+	exit_code = 0;
+	nclients_dealt = 0;// client number
+	partitions_dealt = 0;
+	threads = (TState *) pg_malloc(sizeof(TState) * nthreads);
+
+	for (int i = 0; i < nthreads; i++)
+	{
+		TState     *thread = &threads[i];
+
+		thread->tid = i;
+		thread->state = &state[nclients_dealt];
+		thread->nstate =
+			(nclients - nclients_dealt + nthreads - i - 1) / (nthreads - i);
+		thread->partition = 
+			(partitions == 0) ? 1 : (partitions - partitions_dealt + nthreads - i - 1) / (nthreads - i);
+		thread->logfile = NULL; /* filled in later */
+		thread->latency_late = 0;
+		initStats(&thread->stats, 0);
+
+		nclients_dealt += thread->nstate;
+		partitions_dealt += thread->partition;
+	}
+
+	Assert(nclients_dealt == nclients);
+
+	errno = THREAD_BARRIER_INIT(&barrier, nthreads);
+	if  (errno != 0)
+		pg_fatal("could not initialize barrier: %m");
+
+	for (int i = 1; i < nthreads; i++)
+	{
+		TState     *thread = &threads[i];
+		thread->create_time = pg_time_now();
+		errno = THREAD_CREATE(&thread->thread, initPopulateTablePartially, thread);
+
+		if (errno != 0)
+			pg_fatal("could not create thread: %m");
+	}
+
+	threads[0].create_time = pg_time_now();
+
+
+	(void) initPopulateTablePartially(&threads[0]);
+	
+	for (int i = 0; i < nthreads; i++)
+	{
+		TState    *thread = &threads[i];
+
+		if (i > 0)
+			THREAD_JOIN(thread->thread);
+
+		for (int j = 0; j < thread->nstate; j++)
+			if (thread->state[j].state != CSTATE_FINISHED)
+				exit_code = 2;
+	}
+
+	disconnect_all(state, nclients);
+
+	THREAD_BARRIER_DESTROY(&barrier);
+
+	if (exit_code != 0)
+		pg_log_error("Run was aborted; the above results are incomplete.");
+
+}
+
+static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC
+initPopulateTablePartially(void *arg)
+{
+	int n, partition;
+	int nstate;
+	int64 k, first, last, part_size;
+	const char *table;
+	char		eol;
+	PGresult   *res;
+	PQExpBufferData sql;
+	PGconn  *con;
+	char		copy_statement[256];
+	int chars, log_interval;
+	pg_time_usec_t start;
+	int64		thread_start;
+	const char *copy_statement_fmt = (partitions == 0) ? "copy %s from stdin" : "copy %s%s%d from stdin";
+	int64		total = naccounts * (int64) scale;
+
+	TState	   *thread = (TState *) arg;
+	CState	   *state = thread->state;
+	con = state[0].con;
+	nstate = thread->nstate;
+	chars = 1;
+	log_interval = 1;
+	partition = 0;
+	table = "pgbench_accounts";
+	/* Stay on the same line if reporting to a terminal */
+	eol = isatty(fileno(stderr)) ? '\r' : '\n';
+	
+	if ((con = doConnect()) == NULL)
+		pg_fatal("could not create connection for initialization");
+	for(int p = 1; p <= thread->partition; p++)
+	{
+		initPQExpBuffer(&sql);
+		part_size = (partitions == 0) ? total : (total + partitions - 1)/ partitions;
+		if(partitions > 0)
+		{
+			partition = thread->tid + nthreads * (p - 1) + 1; /* target partition (from 1 to the number set by the --partitions option)*/
+			first = (partition - 1) * part_size;
+			last = (partition == partitions) ? total - 1 : partition * part_size - 1;
+			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table, "_", partition);
+		}else
+		{
+			first = total/nthreads * thread->tid;
+			last = first + total/nthreads - 1;
+			n = pg_snprintf(copy_statement, sizeof(copy_statement), copy_statement_fmt, table);
+		}
+
+		if (n >= sizeof(copy_statement))
+			pg_fatal("invalid buffer size: must be at least %d characters long", n);
+		else if (n == -1)
+			pg_fatal("invalid format string");
+
+		res = PQexec(con, copy_statement);
+		if (PQresultStatus(res) != PGRES_COPY_IN)
+			pg_fatal("unexpected copy in result: %s", PQerrorMessage(con));
+		
+                PQclear(res);
+	
+		for (int i = 0; i < nstate; i++)
+			state[i].state = CSTATE_CHOOSE_SCRIPT;
+
+		start = pg_time_now();
+		THREAD_BARRIER_WAIT(&barrier);
+		thread_start = pg_time_now();
+		thread->started_time = thread_start;
+		
+                for (k = first; k <= last; k++)
+		{
+			int64		j = k + 1;
+			initAccount(&sql, k);
+			if (PQputline(con, sql.data))
+				pg_fatal("PQputline failed");
+	
+			if (CancelRequested)
+				break;
+
+                       /*
+		        * If we want to stick with the original logging, print a message each
+		        * 100k inserted rows.
+		        */
+		        if ((!use_quiet) && (j % 100000 == 0))
+		        {
+		        	double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
+				double		remaining_sec = ((double) total - j) * elapsed_sec / j;
+
+		        	chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
+		        					j, total,
+		        					(int) ((j * 100) / total),
+		        					table, elapsed_sec, remaining_sec, eol);
+                        }
+                        /* let's not call the timing for each row, but only each 100 rows */
+                        else if (use_quiet && (j % 100 == 0))
+                        {
+                                double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
+                                double		remaining_sec = ((double) total - j) * elapsed_sec / j;
+
+                                /* have we reached the next interval (or end)? */
+                                if ((j == total) || (elapsed_sec >= log_interval * LOG_STEP_SECONDS))
+                                {
+                                        chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
+                                                                        j, total,
+                                                                        (int) ((j * 100) / total),
+                                                                        table, elapsed_sec, remaining_sec, eol);
+
+                                    /* skip to the next interval */
+                                    log_interval = (int) ceil(elapsed_sec / LOG_STEP_SECONDS);
+                                }
+                        }
+		}
+		if (chars != 0 && eol != '\n')
+			fprintf(stderr, "%*c\r", chars - 1, ' ');	/* Clear the current line */
+
+		if (PQputline(con, "\\.\n"))
+			pg_fatal("very last PQputline failed");
+		if (PQendcopy(con))
+			pg_fatal("PQendcopy failed");
+
+		termPQExpBuffer(&sql);
+	}
+	THREAD_BARRIER_WAIT(&barrier);
+
+	disconnect_all(state, nstate);
+
+	for (int i = 0; i < nstate; i++)
+		state[i].state = CSTATE_FINISHED;
+
+	THREAD_FUNC_RETURN;
+}
+
+static void
+parallelGenerateDataClientSide(PGconn *con)
+{
+	fprintf(stderr, "generating data (client-side) by multiple worker threads...\n");
 
 	/*
 	 * we do all of this in one transaction to enable the backend's
@@ -5105,10 +5310,55 @@ initGenerateDataClientSide(PGconn *con)
 	 */
 	initPopulateTable(con, "pgbench_branches", nbranches, initBranch);
 	initPopulateTable(con, "pgbench_tellers", ntellers, initTeller);
-	initPopulateTable(con, "pgbench_accounts", naccounts, initAccount);
+	executeStatement(con, "commit");
+	
+	parallelInitPopulateTable(con, "pgbench_accounts", naccounts, initAccount);
+}
 
+static void
+serialGenerateDataClientSide(PGconn *con)
+{
+	fprintf(stderr, "generating data (client-side)...\n");
+	
+	/*
+	 * we do all of this in one transaction to enable the backend's
+	 * data-loading optimizations
+	 */
+	executeStatement(con, "begin");
+
+	/* truncate away any old data */
+	initTruncateTables(con);
+
+	/*
+	 * fill branches, tellers, accounts in that order in case foreign keys
+	 * already exist
+	 */
+	initPopulateTable(con, "pgbench_branches", nbranches, initBranch);
+	initPopulateTable(con, "pgbench_tellers", ntellers, initTeller);
+	initPopulateTable(con, "pgbench_accounts",naccounts, initAccount);
 	executeStatement(con, "commit");
 }
+
+/*
+ * Fill the standard tables with some data generated and sent from the client.
+ *
+ * The filler column is NULL in pgbench_branches and pgbench_tellers, and is
+ * a blank-padded string in pgbench_accounts.
+ */
+static void
+initGenerateDataClientSide(PGconn *con)
+{
+
+	if (nthreads > 1)
+	{
+		parallelGenerateDataClientSide(con);
+	}else
+	{
+		serialGenerateDataClientSide(con);
+	}
+
+}
+
 
 /*
  * Fill the standard tables with some data generated on the server
@@ -5293,6 +5543,7 @@ runInitSteps(const char *initialize_steps)
 				break;
 			case 'g':
 				op = "client-side generate";
+				// initThreads(con);
 				initGenerateDataClientSide(con);
 				break;
 			case 'G':
@@ -6870,7 +7121,6 @@ main(int argc, char **argv)
 				initialization_option_set = true;
 				break;
 			case 'j':			/* jobs */
-				benchmarking_option_set = true;
 				if (!option_parse_int(optarg, "-j/--jobs", 1, INT_MAX,
 									  &nthreads))
 				{
@@ -7098,8 +7348,14 @@ main(int argc, char **argv)
 	 * optimization; throttle_delay is calculated incorrectly below if some
 	 * threads have no clients assigned to them.)
 	 */
-	if (nthreads > nclients)
+	if (!is_init_mode && nthreads > nclients)
 		nthreads = nclients;
+
+	if (is_init_mode && partitions != 0 && nthreads > partitions)
+	{
+		nclients = nthreads;
+		nthreads = partitions;
+	}
 
 	/*
 	 * Convert throttle_delay to a per-thread delay time.  Note that this
