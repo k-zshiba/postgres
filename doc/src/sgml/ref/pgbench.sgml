@@ -381,6 +381,8 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
         <replaceable>NUM</replaceable> partitions of nearly equal size for
         the scaled number of accounts.
         Default is <literal>0</literal>, meaning no partitioning.
+        These options control table creation; data generation uses the existing
+        partition definitions.
        </para>
       </listitem>
      </varlistentry>
@@ -501,6 +503,27 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
         Using more than one thread can be helpful on multi-CPU machines.
         Clients are distributed as evenly as possible among available threads.
         Default is 1.
+       </para>
+       <para>
+        In initialization mode (<option>-i</option>), this sets the maximum
+        number of threads for client-side generation (the <literal>g</literal>
+        step).  On servers running <productname>PostgreSQL</productname> 14 or
+        later, ordinary range partitions on an integer <structfield>aid</structfield>
+        key can be loaded in parallel.  Rows are assigned using existing
+        partition bounds, even when the scale factor changes.  Unsupported
+        layouts or insufficient privileges for direct partition loading cause
+        serial loading.  Server-side generation (<literal>G</literal>) uses
+        one connection.
+       </para>
+       <para>
+        Do not change table definitions from another connection during
+        initialization.  Parallel loading commits the truncation of all tables
+        and loading of branches and tellers before starting account workers,
+        which commit separately.  A failure can therefore leave partially
+        loaded tables; rerun data generation to reload them.  Workers truncate
+        their partitions again to use <command>COPY FREEZE</command>, unless
+        foreign keys reference the accounts table or its partitions, in which
+        case they use ordinary <command>COPY</command> without truncating again.
        </para>
       </listitem>
      </varlistentry>

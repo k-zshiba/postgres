@@ -18,6 +18,8 @@ A_Star
 AbsoluteTime
 AccessMethodInfo
 AccessPriv
+AccountLoadPlan
+AccountPartition
 Acl
 AclItem
 AclMaskHow
@@ -2214,6 +2216,7 @@ PartitionSchemeData
 PartitionSpec
 PartitionStrategy
 PartitionTupleRouting
+PartitionWorker
 PartitionedRelPruneInfo
 PartitionedRelPruningData
 PartitionwiseAggregateType
