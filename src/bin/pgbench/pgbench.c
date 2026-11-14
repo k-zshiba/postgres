@@ -852,6 +852,28 @@ static bool socket_has_input(socket_set *sa, int fd, int idx);
 /* callback used to build rows for COPY during data loading */
 typedef void (*initRowMethod) (PQExpBufferData *sql, int64 curr);
 
+/* Catalog-derived COPY targets, shared until the initialization workers join. */
+typedef struct AccountPartition
+{
+	char	   *name;
+	int64		first;
+	int64		end;
+} AccountPartition;
+
+typedef struct AccountLoadPlan
+{
+	AccountPartition *parts;
+	int			nparts;
+	int			nworkers;
+	bool		use_freeze;
+} AccountLoadPlan;
+
+typedef struct PartitionWorker
+{
+	int			thread_id;
+	const AccountLoadPlan *plan;
+} PartitionWorker;
+
 /* callback functions for our flex lexer */
 static const PsqlScanCallbacks pgbench_callbacks = {
 	NULL,						/* don't need get_variable functionality */
@@ -919,6 +941,7 @@ usage(void)
 		   "                           p: create primary key indexes on the standard tables\n"
 		   "                           f: create foreign keys between the standard tables\n"
 		   "  -F, --fillfactor=NUM     set fill factor\n"
+		   "  -j, --jobs=NUM           number of threads for loading partitions (default: 1)\n"
 		   "  -n, --no-vacuum          do not run VACUUM during initialization\n"
 		   "  -q, --quiet              quiet logging (one message each 5 seconds)\n"
 		   "  -s, --scale=NUM          scaling factor\n"
@@ -5155,6 +5178,188 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 }
 
 /*
+ * Inspect existing partitions after the initial TRUNCATE.  Creation options say
+ * nothing about their present names or bounds.  Concurrent changes to the table
+ * structure during initialization are not supported.
+ */
+static bool
+planAccountLoad(PGconn *con, AccountLoadPlan *plan)
+{
+	PGresult   *res;
+	int64		end = naccounts * (int64) scale + 1;
+	int64		covered = 0;
+	int			nonempty = 0;
+	bool		safe = true;
+	bool		can_truncate = true;
+	const char *sql =
+		"SELECT pg_catalog.quote_ident(n.nspname)||'.'||pg_catalog.quote_ident(c.relname), "
+		"pg_catalog.replace(b[1],'''',''), pg_catalog.replace(b[2],'''',''), "
+		"c.relkind='r' AND NOT i.inhdetachpending "
+		"AND NOT p.relispartition AND p.relpersistence<>'t' "
+		"AND pt.partstrat='r' AND pt.partnatts=1 "
+		"AND a.attname='aid' AND a.atttypid IN (20,23) "
+		"AND o.opcnamespace='pg_catalog'::pg_catalog.regnamespace "
+		"AND o.opcname IN ('int4_ops','int8_ops') AND am.amname='btree' "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_class r "
+		" WHERE r.oid IN ('pgbench_branches'::pg_catalog.regclass, "
+		" 'pgbench_tellers'::pg_catalog.regclass,'pgbench_history'::pg_catalog.regclass) "
+		" AND r.relkind<>'r') "
+		"AND NOT p.relrowsecurity AND NOT p.relforcerowsecurity "
+		"AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_trigger t "
+		" WHERE t.tgrelid IN (p.oid,c.oid,'pgbench_branches'::pg_catalog.regclass, "
+		" 'pgbench_tellers'::pg_catalog.regclass,'pgbench_history'::pg_catalog.regclass) "
+		" AND NOT t.tgisinternal) "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_rewrite r WHERE r.ev_class IN (p.oid,c.oid)) "
+		"AND ARRAY(SELECT attname::text FROM pg_catalog.pg_attribute "
+		" WHERE attrelid=p.oid AND attnum>0 AND NOT attisdropped ORDER BY attnum) "
+		" = ARRAY['aid','bid','abalance','filler'] "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_attribute "
+		" WHERE attrelid IN (p.oid,c.oid) AND attnum>0 AND attgenerated<>'') "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_constraint f "
+		" JOIN pg_catalog.pg_class r ON r.oid=f.confrelid "
+		" WHERE f.contype='f' AND f.conrelid IN (p.oid,c.oid) "
+		" AND (r.relkind<>'r' OR r.oid NOT IN "
+		" ('pgbench_branches'::pg_catalog.regclass,'pgbench_tellers'::pg_catalog.regclass))) "
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_constraint f "
+		" WHERE f.contype='f' AND f.confrelid IN (p.oid,c.oid) "
+		" AND f.conrelid IN ('pgbench_branches'::pg_catalog.regclass, "
+		" 'pgbench_tellers'::pg_catalog.regclass)) "
+		"AND pg_catalog.has_table_privilege(c.oid,'INSERT') "
+		"AND pg_catalog.has_schema_privilege(c.relnamespace,'USAGE'), "
+		"EXISTS (SELECT FROM pg_catalog.pg_constraint f "
+		" WHERE f.contype='f' AND f.confrelid IN (p.oid,c.oid)), "
+		"pg_catalog.has_table_privilege(c.oid,'TRUNCATE') "
+		"FROM pg_catalog.pg_class p "
+		"JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid=p.oid "
+		"JOIN pg_catalog.pg_inherits i ON i.inhparent=p.oid "
+		"JOIN pg_catalog.pg_class c ON c.oid=i.inhrelid "
+		"JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+		"LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=p.oid AND a.attnum=pt.partattrs[0] "
+		"LEFT JOIN pg_catalog.pg_opclass o ON o.oid=pt.partclass[0] "
+		"LEFT JOIN pg_catalog.pg_am am ON am.oid=o.opcmethod "
+	/* pg_get_expr emits this grammar for single integer RANGE bounds. */
+		"LEFT JOIN LATERAL pg_catalog.regexp_match(pg_catalog.pg_get_expr(c.relpartbound,c.oid), "
+		" '^FOR VALUES FROM [(](MINVALUE|''?-?[0-9]+''?)[)] TO [(](MAXVALUE|''?-?[0-9]+''?)[)]$') b ON true "
+		"WHERE p.oid='pgbench_accounts'::pg_catalog.regclass";
+
+	if (PQserverVersion(con) < 140000)
+		return false;
+	res = PQexec(con, sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pg_fatal("could not inspect account partitions: %s", PQerrorMessage(con));
+	plan->nparts = PQntuples(res);
+	plan->parts = pg_malloc0_array(AccountPartition, plan->nparts);
+	plan->use_freeze = true;
+	for (int i = 0; i < plan->nparts; i++)
+	{
+		AccountPartition *part = &plan->parts[i];
+		const char *first = PQgetvalue(res, i, 1);
+		const char *last = PQgetvalue(res, i, 2);
+
+		part->name = pg_strdup(PQgetvalue(res, i, 0));
+		part->first = PG_INT64_MIN;
+		part->end = PG_INT64_MAX;
+		if (strcmp(PQgetvalue(res, i, 3), "t") != 0 ||
+			(strcmp(first, "MINVALUE") != 0 && !strtoint64(first, true, &part->first)) ||
+			(strcmp(last, "MAXVALUE") != 0 && !strtoint64(last, true, &part->end)) ||
+			part->first >= part->end)
+			safe = false;
+		if (strcmp(PQgetvalue(res, i, 4), "t") == 0)
+			plan->use_freeze = false;
+		if (strcmp(PQgetvalue(res, i, 5), "t") != 0)
+			can_truncate = false;
+		part->first = Max((int64) 1, Min(part->first, end));
+		part->end = Max((int64) 1, Min(part->end, end));
+		if (safe && part->first < part->end)
+		{
+			covered += part->end - part->first;
+			nonempty++;
+		}
+	}
+	PQclear(res);
+	plan->nworkers = Min(nthreads, nonempty);
+	/* PostgreSQL guarantees nonoverlapping bounds for attached partitions. */
+	return safe && covered == end - 1 && nonempty > 1 &&
+		(!plan->use_freeze || can_truncate);
+}
+
+static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC
+initPartitionWorkerThread(void *arg)
+{
+	PartitionWorker *worker = (PartitionWorker *) arg;
+	const AccountLoadPlan *plan = worker->plan;
+	PGconn	   *con = doConnect();
+	PQExpBufferData sql;
+	int			task = 0;
+
+	if (con == NULL)
+		pg_fatal("could not create connection for partition worker %d", worker->thread_id);
+	initPQExpBuffer(&sql);
+	executeStatement(con, "begin");
+	for (int i = 0; i < plan->nparts; i++)
+	{
+		const AccountPartition *part = &plan->parts[i];
+		PGresult   *res;
+
+		if (part->first == part->end || task++ % plan->nworkers != worker->thread_id)
+			continue;
+		/* COPY FREEZE needs a TRUNCATE in this worker's transaction. */
+		if (plan->use_freeze)
+		{
+			printfPQExpBuffer(&sql, "TRUNCATE TABLE ONLY %s", part->name);
+			executeStatement(con, sql.data);
+		}
+		/* Explicit columns allow different physical layouts in the leaves. */
+		printfPQExpBuffer(&sql, "COPY %s (aid, bid, abalance, filler) FROM STDIN%s",
+						  part->name, plan->use_freeze ? " WITH (FREEZE ON)" : "");
+		res = PQexec(con, sql.data);
+		if (PQresultStatus(res) != PGRES_COPY_IN)
+			pg_fatal("unexpected copy in result: %s", PQerrorMessage(con));
+		PQclear(res);
+		for (int64 aid = part->first; aid < part->end; aid++)
+		{
+			initAccount(&sql, aid - 1);
+			if (PQputCopyData(con, sql.data, sql.len) <= 0)
+				pg_fatal("PQputCopyData failed for partition %s", part->name);
+			if (CancelRequested)
+				break;
+		}
+		if (PQputCopyEnd(con, CancelRequested ? "canceled by user" : NULL) <= 0)
+			pg_fatal("PQputCopyEnd failed for partition %s", part->name);
+		res = PQgetResult(con);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pg_fatal("COPY failed for partition %s: %s", part->name, PQerrorMessage(con));
+		PQclear(res);
+	}
+	executeStatement(con, "commit");
+	termPQExpBuffer(&sql);
+	PQfinish(con);
+	THREAD_FUNC_RETURN;
+}
+
+static void
+initLoadAccountsParallel(const AccountLoadPlan *plan)
+{
+	THREAD_T   *threads = pg_malloc_array(THREAD_T, plan->nworkers);
+	PartitionWorker *workers = pg_malloc_array(PartitionWorker, plan->nworkers);
+
+	fprintf(stderr, "loading pgbench_accounts with %d threads...\n", plan->nworkers);
+	for (int i = 0; i < plan->nworkers; i++)
+	{
+		workers[i].thread_id = i;
+		workers[i].plan = plan;
+		errno = THREAD_CREATE(&threads[i], initPartitionWorkerThread, &workers[i]);
+		if (errno != 0)
+			pg_fatal("could not create thread: %m");
+	}
+	for (int i = 0; i < plan->nworkers; i++)
+		THREAD_JOIN(threads[i]);
+	pg_free(threads);
+	pg_free(workers);
+}
+
+/*
  * Fill the standard tables with some data generated and sent from the client.
  *
  * The filler column is NULL in pgbench_branches and pgbench_tellers, and is
@@ -5163,16 +5368,25 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 static void
 initGenerateDataClientSide(PGconn *con)
 {
+	AccountLoadPlan plan = {0};
+	bool		parallel = false;
+
 	fprintf(stderr, "generating data (client-side)...\n");
 
 	/*
-	 * we do all of this in one transaction to enable the backend's
-	 * data-loading optimizations
+	 * Serial loading uses one transaction.  Parallel loading commits the
+	 * TRUNCATE and supporting tables before workers start their transactions.
 	 */
 	executeStatement(con, "begin");
 
 	/* truncate away any old data */
 	initTruncateTables(con);
+	if (nthreads > 1)
+	{
+		parallel = planAccountLoad(con, &plan);
+		if (!parallel)
+			pg_log_info("using serial account loading: unsupported layout, insertion behavior, or privileges");
+	}
 
 	/*
 	 * fill branches, tellers, accounts in that order in case foreign keys
@@ -5180,9 +5394,19 @@ initGenerateDataClientSide(PGconn *con)
 	 */
 	initPopulateTable(con, "pgbench_branches", nbranches, initBranch);
 	initPopulateTable(con, "pgbench_tellers", ntellers, initTeller);
-	initPopulateTable(con, "pgbench_accounts", naccounts, initAccount);
-
-	executeStatement(con, "commit");
+	if (parallel)
+	{
+		executeStatement(con, "commit");
+		initLoadAccountsParallel(&plan);
+	}
+	else
+	{
+		initPopulateTable(con, "pgbench_accounts", naccounts, initAccount);
+		executeStatement(con, "commit");
+	}
+	for (int i = 0; i < plan.nparts; i++)
+		pg_free(plan.parts[i].name);
+	pg_free(plan.parts);
 }
 
 /*
@@ -6953,7 +7177,6 @@ main(int argc, char **argv)
 				initialization_option_set = true;
 				break;
 			case 'j':			/* jobs */
-				benchmarking_option_set = true;
 				if (!option_parse_int(optarg, "-j/--jobs", 1, INT_MAX,
 									  &nthreads))
 				{
@@ -7183,9 +7406,10 @@ main(int argc, char **argv)
 	/*
 	 * Don't need more threads than there are clients.  (This is not merely an
 	 * optimization; throttle_delay is calculated incorrectly below if some
-	 * threads have no clients assigned to them.)
+	 * threads have no clients assigned to them.)  In initialization mode,
+	 * workers load partitions instead of serving clients.
 	 */
-	if (nthreads > nclients)
+	if (nthreads > nclients && !is_init_mode)
 		nthreads = nclients;
 
 	/*
