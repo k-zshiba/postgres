@@ -164,6 +164,108 @@ $node->pgbench(
 # Check data state, after server-side data generation.
 check_data_state($node, 'server-side');
 
+# Creation and parallel loading are independent.  In particular, changing
+# scale must not change the boundaries used for existing partitions.
+$node->pgbench(
+	'-i -I dtp -s 1 --partitions=4',
+	0, [],
+	[qr{creating 4 partitions}],
+	'create partitions before loading');
+for my $scale (2, 2, 1)
+{
+	$node->pgbench(
+		"-i -I g -s $scale -j 8",
+		0, [],
+		[qr{loading pgbench_accounts with 4 threads}],
+		"parallel reload at scale $scale");
+	is( $node->safe_psql(
+			'postgres',
+			'SELECT count(*), count(DISTINCT aid), max(aid) FROM pgbench_accounts'
+		),
+		join('|', ($scale * 100000) x 3),
+		'all account IDs loaded once');
+	is( $node->safe_psql(
+			'postgres',
+			'SELECT count(*) FROM pgbench_accounts GROUP BY tableoid ORDER BY min(aid)'
+		),
+		join("\n", 25000, 25000, 25000, $scale * 100000 - 75000),
+		'existing boundaries determine row distribution');
+}
+
+# Direct loading must quote discovered names and must not truncate individual
+# leaves when a foreign key references the parent or a leaf.
+$node->safe_psql(
+	'postgres', q{
+CREATE SCHEMA "init schema";
+ALTER TABLE pgbench_accounts_1 SET SCHEMA "init schema";
+ALTER TABLE "init schema".pgbench_accounts_1 RENAME TO "odd ' leaf";
+});
+for my $target ('pgbench_accounts', q{"init schema"."odd ' leaf"})
+{
+	$node->safe_psql('postgres',
+		"ALTER TABLE pgbench_history ADD FOREIGN KEY(aid) REFERENCES $target(aid)"
+	);
+	$node->pgbench(
+		'-i -I g -j 2 --partitions=1 --partition-method=hash',
+		0,
+		[],
+		[qr{loading pgbench_accounts with 2 threads}],
+		'foreign key and creation options do not prevent parallel reload');
+	is( $node->safe_psql('postgres', 'SELECT count(*) FROM pgbench_accounts'),
+		'100000',
+		'referenced accounts loaded');
+	$node->safe_psql('postgres',
+		'ALTER TABLE pgbench_history DROP CONSTRAINT pgbench_history_aid_fkey'
+	);
+}
+
+# Supporting rows cannot commit before accounts when a deferred FK needs them.
+$node->safe_psql(
+	'postgres', q{
+ALTER TABLE pgbench_branches ADD CONSTRAINT accounts_fkey FOREIGN KEY(bid)
+ REFERENCES pgbench_accounts(aid) DEFERRABLE INITIALLY DEFERRED;
+});
+$node->pgbench(
+	'-i -I g -j 2', 0, [],
+	[qr{using serial account loading}],
+	'deferred supporting-table foreign key uses one transaction');
+$node->safe_psql('postgres',
+	'ALTER TABLE pgbench_branches DROP CONSTRAINT accounts_fkey');
+
+# Exercise quoted int8 bounds, unequal ranges and an empty task.
+$node->safe_psql(
+	'postgres', q{
+DROP TABLE pgbench_accounts;
+CREATE TABLE pgbench_accounts(aid bigint, bid integer, abalance integer,
+ filler char(84)) PARTITION BY RANGE(aid);
+CREATE TABLE low PARTITION OF pgbench_accounts FOR VALUES FROM (MINVALUE) TO (12345);
+CREATE TABLE middle PARTITION OF pgbench_accounts FOR VALUES FROM (12345) TO (100001);
+CREATE TABLE high PARTITION OF pgbench_accounts FOR VALUES FROM (100001) TO (MAXVALUE);
+INSERT INTO high VALUES (200000, 2, 0, 'old');
+});
+$node->pgbench(
+	'-i -I g -j 8', 0, [],
+	[qr{loading pgbench_accounts with 2 threads}],
+	'only partitions receiving rows need workers');
+is( $node->safe_psql(
+		'postgres',
+		'SELECT count(*), count(DISTINCT aid), max(aid) FROM pgbench_accounts'
+	),
+	'100000|100000|100000',
+	'int8 bounds and empty task loaded correctly');
+$node->pgbench('-i -I dt -j 2 --partitions=2 --partition-method=hash',
+	0, [], [], 'create unsupported layout');
+$node->pgbench(
+	'-i -I g -j 2', 0, [],
+	[qr{using serial account loading}],
+	'hash uses serial loading');
+check_data_state($node, 'parallel and serial reloads');
+$node->pgbench(
+	'-i -j 2 --partitions=2',
+	0, [],
+	[qr{loading pgbench_accounts with 2 threads}],
+	'full parallel initialization before benchmark tests');
+
 # Run all builtin scripts, for a few transactions each
 $node->pgbench(
 	'--transactions=5 -Dfoo=bla --client=2 --protocol=simple --builtin=t'
